@@ -2,7 +2,7 @@
 """
 Loss functions
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -69,8 +69,8 @@ class QFocalLoss(nn.Module):
         self.loss_fcn = loss_fcn  # must be nn.BCEWithLogitsLoss()
         self.gamma = gamma
         self.alpha = alpha
-        self.reduction = loss_fcn.reduction
         self.loss_fcn.reduction = 'none'  # required to apply FL to each element
+        self.reduction = loss_fcn.reduction
 
     def forward(self, pred, true):
         loss = self.loss_fcn(pred, true)
@@ -99,7 +99,7 @@ class ComputeLoss:
         self.sort_obj_iou = sort_obj_iou
 
         # Define criteria
-        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))
+        BCEcls = nn.BCEWithLogitsLoss(reduction="none", pos_weight=torch.tensor([h['cls_pw']], device=device))
         BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
 
         # gClass label smoothin https://arxiv.org/pdf/1902.04103.pdf eqn 3
@@ -153,39 +153,70 @@ class ComputeLoss:
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
                 iou_ = iou.detach().clamp(0).type(tobj.dtype)
+
                 tobj[b, a, gj, gi] = iou_  # iou ratio
                 _, _, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
 
-                obji = self.BCEobj(pi[..., 4], tobj)
-
+                # obji = self.BCEobj(pi[..., 4], tobj)
+                # print(3)
+                # print(obji)
+                # print(np.shape(obji))
                 # cls_rank = pcls.argsort()
                 # cls_score = torch.ones_like(pcls)
                 # Classification
+                p_pos_weight = []
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
                     # t, pcls = t[cls_rank], pcls[cls_rank]
 
                     # lcls += self.BCEcls(pcls, t)  # BCE
-                    cls_score = self.BCEcls(pcls, t)  # BCE
-                    p_pos = torch.exp(-1 * iou/iou.sum() * 5) * (1 - cls_score) * (1 - obji)
+                    cls_score = self.BCEcls(pcls, t)  # BCE #pcls maybe
+                    # print(2)
+                    # print(cls_score)
+                    # print(np.shape(cls_score))
+                    # print(1)
+                    # print(iou)
+                    # print(np.shape(iou))
+                    # print(np.shape(torch.unsqueeze(torch.exp(-1 * iou / iou.sum() * 5), 1)))
+                    # p_pos = torch.exp(-1 * iou/iou.sum() * 5) * (1 - cls_score) * (1 - obji)
+                    # p_pos = torch.mul((1 - cls_score/cls_score.sum()), torch.unsqueeze(torch.exp(-1 * iou / iou.sum() * 5), 1))
+
+                    t_f = torch.tensor(t)
+                    t_f[t_f[:, :] == 0] = -1
+                    # print(t_f)
+                    # print(pcls)
+                    # print(torch.mul(pcls, t_f))
+                    # print(np.shape(torch.mul(pcls, t_f)))
+                    # print(torch.exp(torch.mul(pcls, t_f)))
+                    # print(torch.exp(torch.mul(pcls, t_f)) / torch.sum(torch.exp(torch.mul(pcls, t_f))))
+                    pcls_score = torch.exp(torch.mul(pcls, t_f)) / torch.sum(torch.exp(torch.mul(pcls, t_f)))
+                    p_pos = torch.mul(torch.sigmoid(pcls_score),
+                                      torch.unsqueeze(torch.exp(-1 * iou / iou.sum() * 5), 1))
+                    # p_pos = torch.mul(torch.sigmoid(pcls_score),
+                    #                   torch.unsqueeze(torch.exp(-1 * iou / iou.sum() * 5), 1))
+                    # print(np.shape(p_pos))
                     # p_pos = iou * (1-cls_score) * (1-obji)
                     # p_pos = torch.pow(iou/iou.sum(), 5) * (1 - cls_score) * (1 - obji)
                     # p_pos = iou * (1/cls_score+1e-12) * (1/obji+1e-12)
-
+                    del t_f
                     p_pos_weight = (torch.exp(5 * p_pos) * p_pos) / (
                             torch.exp(3 * p_pos) * p_pos).sum(0, keepdim=True).clamp(min=1e-12)
                     p_pos_weight = p_pos_weight.detach()
+                    print(p_pos_weight)
                     loss_cls = cls_score * p_pos_weight
                     lcls += loss_cls.sum()
-                    loss_bbox = (1.0 - iou) * p_pos_weight
+                    loss_bbox = torch.unsqueeze((1.0 - iou), 1) * p_pos_weight
                     lbox += loss_bbox.mean()
                     # lbox += loss_bbox.sum()
-                    loss_obj = obji * p_pos_weight
-                    lobj += loss_obj.sum() * self.balance[i]  # obj loss
+
                 else:
                     lbox += (1.0 - iou).mean()  # iou loss
-                    lobj += lobj * self.balance[i]
+
+                obji = self.BCEobj(pi[..., 4], tobj)
+                lobj += obji * self.balance[i]  # obj loss
+                # loss_obj = obji * p_pos_weight
+                # lobj += loss_obj.sum() * self.balance[i]  # obj loss
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
